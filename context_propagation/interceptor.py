@@ -1,184 +1,139 @@
-from __future__ import annotations
+from collections.abc import Coroutine
+from dataclasses import asdict, is_dataclass
 
-from contextlib import contextmanager
-from typing import Any, Mapping, Protocol, Type
+from temporalio import activity, workflow
+from temporalio.worker import (
+    ActivityInboundInterceptor,
+    ExecuteActivityInput,
+    ExecuteWorkflowInput,
+    Interceptor,
+    WorkflowInboundInterceptor,
+    WorkflowInterceptorClassInput,
+)
+from typing_extensions import override
 
-import temporalio.activity
-import temporalio.api.common.v1
-import temporalio.client
-import temporalio.converter
-import temporalio.worker
-import temporalio.workflow
+with workflow.unsafe.imports_passed_through():
+    from sentry_sdk import Scope, isolation_scope
 
-with temporalio.workflow.unsafe.imports_passed_through():
-    from context_propagation.shared import HEADER_KEY, user_id
+from custom_contextvars import _ALL_CONTEXTVARS
 
 
-class _InputWithHeaders(Protocol):
-    headers: Mapping[str, temporalio.api.common.v1.Payload]
-
-
-def set_header_from_context(
-    input: _InputWithHeaders, payload_converter: temporalio.converter.PayloadConverter
+def _set_common_workflow_tags(
+    scope: Scope,
+    info: workflow.Info | activity.Info,
 ) -> None:
-    user_id_val = user_id.get()
-    if user_id_val:
-        input.headers = {
-            **input.headers,
-            HEADER_KEY: payload_converter.to_payload(user_id_val),
-        }
+    scope.set_tag("temporal.workflow.type", info.workflow_type)
+    scope.set_tag("temporal.workflow.id", info.workflow_id)
+    for cv in _ALL_CONTEXTVARS:
+        if cv_value := cv.get(None):
+            scope.set_tag(cv.name, cv_value)
 
 
-@contextmanager
-def context_from_header(
-    input: _InputWithHeaders, payload_converter: temporalio.converter.PayloadConverter
-):
-    payload = input.headers.get(HEADER_KEY)
-    token = (
-        user_id.set(payload_converter.from_payload(payload, str)) if payload else None
-    )
-    try:
-        yield
-    finally:
-        if token:
-            user_id.reset(token)
+class _SentryExceptionActivityInboundInterceptor(ActivityInboundInterceptor):
+    @override
+    async def execute_activity(self, input: ExecuteActivityInput) -> Coroutine:
+        # https://docs.sentry.io/platforms/python/troubleshooting/#addressing-concurrency-issues
+        with isolation_scope() as scope:
+            scope.set_tag("temporal.execution_type", "activity")
+            scope.set_tag(
+                "module",
+                input.fn.__module__ + "." + input.fn.__qualname__,
+            )
+
+            activity_info = activity.info()
+            _set_common_workflow_tags(scope, activity_info)
+            scope.set_tag("temporal.activity.id", activity_info.activity_id)
+            scope.set_tag(
+                "temporal.activity.type",
+                activity_info.activity_type,
+            )
+            scope.set_tag(
+                "temporal.activity.task_queue",
+                activity_info.task_queue,
+            )
+            scope.set_tag(
+                "temporal.workflow.namespace",
+                activity_info.workflow_namespace,
+            )
+            scope.set_tag(
+                "temporal.workflow.run_id",
+                activity_info.workflow_run_id,
+            )
+            try:
+                return await super().execute_activity(input)
+            except Exception:
+                if len(input.args) == 1 and is_dataclass(input.args[0]):
+                    scope.set_context(
+                        "temporal.activity.input",
+                        asdict(input.args[0]),  # type: ignore  # noqa: PGH003
+                    )
+                scope.set_context(
+                    "temporal.activity.info",
+                    activity.info().__dict__,
+                )
+                scope.capture_exception()
+                raise
 
 
-class ContextPropagationInterceptor(
-    temporalio.client.Interceptor, temporalio.worker.Interceptor
-):
-    """Interceptor that can serialize/deserialize contexts."""
+class _SentryExceptionWorkflowInterceptor(WorkflowInboundInterceptor):
+    @override
+    async def execute_workflow(self, input: ExecuteWorkflowInput) -> Coroutine:
+        # https://docs.sentry.io/platforms/python/troubleshooting/#addressing-concurrency-issues
+        with isolation_scope() as scope:
+            scope.set_tag("temporal.execution_type", "workflow")
+            scope.set_tag(
+                "module",
+                input.run_fn.__module__ + "." + input.run_fn.__qualname__,
+            )
+            workflow_info = workflow.info()
+            _set_common_workflow_tags(scope, workflow_info)
+            scope.set_tag(
+                "temporal.workflow.task_queue",
+                workflow_info.task_queue,
+            )
+            scope.set_tag(
+                "temporal.workflow.namespace",
+                workflow_info.namespace,
+            )
+            scope.set_tag("temporal.workflow.run_id", workflow_info.run_id)
+            try:
+                return await super().execute_workflow(input)
+            except Exception:
+                if len(input.args) == 1 and is_dataclass(input.args[0]):
+                    scope.set_context(
+                        "temporal.workflow.input",
+                        asdict(input.args[0]),  # type: ignore  # noqa: PGH003
+                    )
+                scope.set_context(
+                    "temporal.workflow.info",
+                    workflow.info().__dict__,
+                )
 
-    def __init__(
+                if not workflow.unsafe.is_replaying():
+                    with (
+                        workflow.unsafe.sandbox_unrestricted(),
+                        workflow.unsafe.imports_passed_through(),
+                    ):
+                        scope.capture_exception()
+                raise
+
+
+class SentryExceptionInterceptor(Interceptor):
+    """Temporal Interceptor class which will report workflow & activity exceptions to Sentry."""
+
+    @override
+    def intercept_activity(
         self,
-        payload_converter: temporalio.converter.PayloadConverter = temporalio.converter.default().payload_converter,
-    ) -> None:
-        self._payload_converter = payload_converter
-
-    def intercept_client(
-        self, next: temporalio.client.OutboundInterceptor
-    ) -> temporalio.client.OutboundInterceptor:
-        return _ContextPropagationClientOutboundInterceptor(
-            next, self._payload_converter
+        next: ActivityInboundInterceptor,
+    ) -> ActivityInboundInterceptor:
+        """Implementation of :py:meth:`temporalio.worker.Interceptor.intercept_activity`."""
+        return _SentryExceptionActivityInboundInterceptor(
+            super().intercept_activity(next),
         )
 
-    def intercept_activity(
-        self, next: temporalio.worker.ActivityInboundInterceptor
-    ) -> temporalio.worker.ActivityInboundInterceptor:
-        return _ContextPropagationActivityInboundInterceptor(next)
-
+    @override
     def workflow_interceptor_class(
-        self, input: temporalio.worker.WorkflowInterceptorClassInput
-    ) -> Type[_ContextPropagationWorkflowInboundInterceptor]:
-        return _ContextPropagationWorkflowInboundInterceptor
-
-
-class _ContextPropagationClientOutboundInterceptor(
-    temporalio.client.OutboundInterceptor
-):
-    def __init__(
         self,
-        next: temporalio.client.OutboundInterceptor,
-        payload_converter: temporalio.converter.PayloadConverter,
-    ) -> None:
-        super().__init__(next)
-        self._payload_converter = payload_converter
-
-    async def start_workflow(
-        self, input: temporalio.client.StartWorkflowInput
-    ) -> temporalio.client.WorkflowHandle[Any, Any]:
-        set_header_from_context(input, self._payload_converter)
-        return await super().start_workflow(input)
-
-    async def query_workflow(self, input: temporalio.client.QueryWorkflowInput) -> Any:
-        set_header_from_context(input, self._payload_converter)
-        return await super().query_workflow(input)
-
-    async def signal_workflow(
-        self, input: temporalio.client.SignalWorkflowInput
-    ) -> None:
-        set_header_from_context(input, self._payload_converter)
-        await super().signal_workflow(input)
-
-    async def start_workflow_update(
-        self, input: temporalio.client.StartWorkflowUpdateInput
-    ) -> temporalio.client.WorkflowUpdateHandle[Any]:
-        set_header_from_context(input, self._payload_converter)
-        return await self.next.start_workflow_update(input)
-
-
-class _ContextPropagationActivityInboundInterceptor(
-    temporalio.worker.ActivityInboundInterceptor
-):
-    async def execute_activity(
-        self, input: temporalio.worker.ExecuteActivityInput
-    ) -> Any:
-        with context_from_header(input, temporalio.activity.payload_converter()):
-            return await self.next.execute_activity(input)
-
-
-class _ContextPropagationWorkflowInboundInterceptor(
-    temporalio.worker.WorkflowInboundInterceptor
-):
-    def init(self, outbound: temporalio.worker.WorkflowOutboundInterceptor) -> None:
-        self.next.init(_ContextPropagationWorkflowOutboundInterceptor(outbound))
-
-    async def execute_workflow(
-        self, input: temporalio.worker.ExecuteWorkflowInput
-    ) -> Any:
-        with context_from_header(input, temporalio.workflow.payload_converter()):
-            return await self.next.execute_workflow(input)
-
-    async def handle_signal(self, input: temporalio.worker.HandleSignalInput) -> None:
-        with context_from_header(input, temporalio.workflow.payload_converter()):
-            return await self.next.handle_signal(input)
-
-    async def handle_query(self, input: temporalio.worker.HandleQueryInput) -> Any:
-        with context_from_header(input, temporalio.workflow.payload_converter()):
-            return await self.next.handle_query(input)
-
-    def handle_update_validator(
-        self, input: temporalio.worker.HandleUpdateInput
-    ) -> None:
-        with context_from_header(input, temporalio.workflow.payload_converter()):
-            self.next.handle_update_validator(input)
-
-    async def handle_update_handler(
-        self, input: temporalio.worker.HandleUpdateInput
-    ) -> Any:
-        with context_from_header(input, temporalio.workflow.payload_converter()):
-            return await self.next.handle_update_handler(input)
-
-
-class _ContextPropagationWorkflowOutboundInterceptor(
-    temporalio.worker.WorkflowOutboundInterceptor
-):
-    async def signal_child_workflow(
-        self, input: temporalio.worker.SignalChildWorkflowInput
-    ) -> None:
-        set_header_from_context(input, temporalio.workflow.payload_converter())
-        return await self.next.signal_child_workflow(input)
-
-    async def signal_external_workflow(
-        self, input: temporalio.worker.SignalExternalWorkflowInput
-    ) -> None:
-        set_header_from_context(input, temporalio.workflow.payload_converter())
-        return await self.next.signal_external_workflow(input)
-
-    def start_activity(
-        self, input: temporalio.worker.StartActivityInput
-    ) -> temporalio.workflow.ActivityHandle:
-        set_header_from_context(input, temporalio.workflow.payload_converter())
-        return self.next.start_activity(input)
-
-    async def start_child_workflow(
-        self, input: temporalio.worker.StartChildWorkflowInput
-    ) -> temporalio.workflow.ChildWorkflowHandle:
-        set_header_from_context(input, temporalio.workflow.payload_converter())
-        return await self.next.start_child_workflow(input)
-
-    def start_local_activity(
-        self, input: temporalio.worker.StartLocalActivityInput
-    ) -> temporalio.workflow.ActivityHandle:
-        set_header_from_context(input, temporalio.workflow.payload_converter())
-        return self.next.start_local_activity(input)
+        input: WorkflowInterceptorClassInput,
+    ) -> type[WorkflowInboundInterceptor] | None:
+        return _SentryExceptionWorkflowInterceptor

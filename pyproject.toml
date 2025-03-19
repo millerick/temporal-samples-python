@@ -16,7 +16,7 @@ packages = [
 "Bug Tracker" = "https://github.com/temporalio/samples-python/issues"
 
 [tool.poetry.dependencies]
-python = "^3.9"
+python = "^3.11"
 temporalio = "^1.10.0"
 
 [tool.poetry.dev-dependencies]
@@ -71,7 +71,7 @@ dependencies = { pydantic = "^2.10.6" }
 
 [tool.poetry.group.sentry]
 optional = true
-dependencies = { sentry-sdk = "^1.11.0" }
+dependencies = { sentry-sdk = "^2.22.0" }
 
 [tool.poetry.group.trio_async]
 optional = true

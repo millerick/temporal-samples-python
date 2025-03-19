@@ -1,48 +1,35 @@
 import asyncio
 import logging
 import os
-from dataclasses import dataclass
-from datetime import timedelta
 
 import sentry_sdk
-from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.worker import Worker
+from activities import compose_greeting
+from workflows import GreetingWorkflow
+from sentry_sdk.integrations.asyncio import AsyncioIntegration
 
 from sentry.interceptor import SentryInterceptor
-
-
-@dataclass
-class ComposeGreetingInput:
-    greeting: str
-    name: str
-
-
-@activity.defn
-async def compose_greeting(input: ComposeGreetingInput) -> str:
-    activity.logger.info("Running activity with parameter %s" % input)
-    return f"{input.greeting}, {input.name}!"
-
-
-@workflow.defn
-class GreetingWorkflow:
-    @workflow.run
-    async def run(self, name: str) -> str:
-        workflow.logger.info("Running workflow with parameter %s" % name)
-        return await workflow.execute_activity(
-            compose_greeting,
-            ComposeGreetingInput("Hello", name),
-            start_to_close_timeout=timedelta(seconds=10),
-        )
-
+from sentry.tracing_interceptor import SentryTracingInterceptor
 
 async def main():
     # Uncomment the line below to see logging
-    # logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO)
 
     # Initialize the Sentry SDK
     sentry_sdk.init(
+        environment="dev",
+        # Tracing
+        enable_tracing=True,
         dsn=os.environ.get("SENTRY_DSN"),
+        traces_sample_rate=1.0,
+        profiles_sample_rate=1.0,
+        send_default_pii=True,
+        integrations=[
+            AsyncioIntegration(),
+        ],
+        max_request_body_size="always",
+        max_value_length=10240,
     )
 
     # Start client
@@ -54,7 +41,7 @@ async def main():
         task_queue="sentry-task-queue",
         workflows=[GreetingWorkflow],
         activities=[compose_greeting],
-        interceptors=[SentryInterceptor()],  # Use SentryInterceptor for error reporting
+        interceptors=[SentryInterceptor(), SentryTracingInterceptor()],  # Use SentryInterceptor for error reporting
     )
 
     await worker.run()
